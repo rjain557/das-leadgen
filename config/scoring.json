@@ -1,0 +1,50 @@
+{
+  "_comment": "Danielian Pursuit Intelligence scoring rubric (spec §6). Config-driven and tunable during the pilot WITHOUT code changes. Calibrate with Deborah Muro in Week 3. Consumed by scripts/score-lib.js.",
+  "version": "1.0",
+  "projectTypePoints": {
+    "multifamily": 5,
+    "btr": 5,
+    "master-plan": 5,
+    "mixed-use": 4,
+    "affordable": 4,
+    "adu-batch": 3,
+    "sfr": 1,
+    "unknown": 0
+  },
+  "stagePoints": {
+    "land-acquired": 4,
+    "ceqa-nop": 4,
+    "entitlement": 3,
+    "planning-agenda": 3,
+    "permit-filed": 1,
+    "unknown": 0
+  },
+  "scalePoints": [
+    { "minUnits": 200, "points": 4, "label": "≥200 units — major design engagement" },
+    { "minUnits": 50,  "points": 3, "label": "50–199 units" },
+    { "minUnits": 10,  "points": 1, "label": "10–49 units" }
+  ],
+  "geographyPoints": { "activeMetro": 2 },
+  "relationshipPoints": { "knownRepeatDeveloper": 5, "knownMunicipality": 1 },
+  "legislativePoints": {
+    "_comment": "Awarded once if any 'why now' tailwind is present (SB 79 corridor / density-bonus / builder's-remedy).",
+    "anyTailwind": 2
+  },
+  "multiSourcePoints": 2,
+  "penalties": {
+    "architectOfRecordNamed": -3,
+    "outsideGeography": -2,
+    "nonResidential": -3
+  },
+  "tiers": {
+    "_comment": "score >= threshold assigns the tier. Below tier3 = Drop.",
+    "tier1": 12,
+    "tier2": 7,
+    "tier3": 3
+  },
+  "tierLabels": {
+    "1": "Tier 1 — Act now (full dossier in the Brief)",
+    "2": "Tier 2 — Watch (Brief appendix / watchlist)",
+    "3": "Tier 3 — Monitor (CSV only)"
+  }
+}

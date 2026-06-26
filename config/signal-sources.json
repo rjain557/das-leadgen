@@ -1,0 +1,69 @@
+{
+  "_comment": "All non-permit signal-layer source endpoints / dataset ids (spec Appendix B + §4). Edit to add/disable a source without touching code. 'verify' = confirm live during Phase 0. The orchestrator (scripts/run-all-layers.js) reads the 'enabled' flag and 'agent' dir for each layer.",
+  "version": "1.0",
+  "layers": {
+    "L1_permits": {
+      "label": "Building permits", "leadTimeMonths": "0-3", "enabled": true,
+      "agentGlob": "permits/**", "source": "see config/jurisdictions.json",
+      "note": "Per-jurisdiction; OC via Playwright agents, LA/Nashville via Socrata."
+    },
+    "L2_planning": {
+      "label": "Planning commission / Design Review agendas", "leadTimeMonths": "3-9", "enabled": true,
+      "agent": "planning-drb", "platforms": ["granicus", "legistar", "primegov", "civicclerk", "city-cms"],
+      "note": "Reuses BBC agents/drb multi-platform scraper + pdf-parse. Entitlement signal — design-team selection within 90-180 days."
+    },
+    "L3_ceqa": {
+      "label": "CEQA / EIR environmental filings", "leadTimeMonths": "12-18", "enabled": true,
+      "agent": "ceqa", "type": "api-or-scrape",
+      "base": "https://ceqanet.opr.ca.gov",
+      "searchBase": "https://ceqanet.opr.ca.gov/Search",
+      "documentTypes": ["NOP", "NOD", "EIR", "MND", "NOE"],
+      "filters": ["residential", "mixed-use"], "minUnits": 10,
+      "stateScope": "CA-only",
+      "verify": "phase-0 — confirm whether CEQAnet exposes a JSON/CSV export or query API; otherwise HTML search harvest. NOP is the earliest signal (12-18mo)."
+    },
+    "L4_deeds": {
+      "label": "Land transfers / deeds", "leadTimeMonths": "6-12", "enabled": true,
+      "agent": "deeds", "type": "attom-plus-recorder",
+      "attomEndpoint": "transactions", "granteeIsLLC": true,
+      "fallback": "OC RecorderWorks (https://cr.ocgov.com/recorderworks/) / LA Registrar-Recorder",
+      "note": "Prefer ATTOM transaction/deed endpoints (key reused from BBC). Flag LLC/developer grantees on multifamily-zoned/sized parcels."
+    },
+    "L5_hcd": {
+      "label": "CA HCD / density-bonus / streamlining", "leadTimeMonths": "6-18", "enabled": true,
+      "agent": "hcd", "type": "ckan-api",
+      "base": "https://data.ca.gov",
+      "datasets": ["housing-element-annual-progress-report", "regional-housing-needs-allocation-rhna"],
+      "ckanResourceApi": "https://data.ca.gov/api/3/action/datastore_search",
+      "track": ["builders-remedy", "sb35", "sb423"],
+      "stateScope": "CA-only", "difficulty": "hard-mvp",
+      "verify": "phase-0 — confirm current HCD APR / RHNA CKAN resource ids on data.ca.gov. Partly news-augmented at MVP."
+    },
+    "L6_sb79": {
+      "label": "SB 79 / transit-corridor / ADU-batch triggers", "leadTimeMonths": "predictive", "enabled": true,
+      "agent": "sb79", "type": "gtfs-overlay", "effectiveDate": "2026-07-01",
+      "gtfs": {
+        "OCTA": "https://octa.net/current/google_transit.zip",
+        "LA_METRO": "https://gitlab.com/LACMTA/gtfs_bus/-/raw/master/gtfs_bus.zip",
+        "NASHVILLE_WEGO": "https://www.wegotransit.com/google_transit.zip"
+      },
+      "distanceTiersMeters": [400, 800, 1600],
+      "difficulty": "hard-mvp",
+      "verify": "phase-0 — confirm GTFS static feed URLs (transit agencies rotate them). MVP = overlay stops against harvested records and FLAG within SB 79 tiers, not full parcel scan (Phase-4 enhancement)."
+    },
+    "L7_news": {
+      "label": "Developer & national-builder news", "leadTimeMonths": "variable", "enabled": true,
+      "agent": "developer-news", "type": "serpapi",
+      "engine": "google_news", "tokenKey": "SERPAPI_KEY",
+      "nationalBuilders": ["D.R. Horton", "Lennar", "Toll Brothers", "Tri Pointe", "Taylor Morrison", "Brookfield"],
+      "repeatDevelopers": ["__SEED_FROM_PHASE_0__"],
+      "note": "Reuses tech-leads news_fetch pattern (SerpAPI google_news). Crown-jewel repeat-developer queries seeded in Phase 0 (discovery item 2)."
+    }
+  },
+  "enrichment": {
+    "geocode": { "provider": "google", "tokenKey": "GOOGLE_GEOCODING_API_KEY" },
+    "property": { "provider": "attom", "tokenKey": "ATTOM_API_KEY", "fips": { "OC": "06059", "LA": "06037", "NASHVILLE": "47037" } },
+    "developerEntity": { "providers": ["ca-sos-bizfile", "opencorporates"], "note": "LLC grantee → real developer principal (spec §7, the one net-new enrichment problem)" },
+    "contacts": { "provider": "hunter", "tokenKey": "HUNTER_API_KEY", "fallback": ["batchdata", "spokeo"] }
+  }
+}

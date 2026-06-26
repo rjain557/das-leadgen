@@ -1,0 +1,43 @@
+{
+  "name": "das-leadgen",
+  "version": "0.1.0",
+  "private": true,
+  "description": "Danielian Pursuit Intelligence — AI pursuit-intelligence engine surfacing residential development projects 3–12 months pre-RFQ across OC / LA / Nashville (internal code: das-leadgen).",
+  "type": "commonjs",
+  "engines": { "node": ">=20" },
+  "scripts": {
+    "pipeline": "node scripts/run-all-layers.js",
+    "pipeline:brief": "node scripts/run-all-layers.js --brief",
+    "pipeline:weekly": "node scripts/run-all-layers.js --brief --email",
+    "preflight": "node scripts/preflight-check.js",
+    "smoke": "node scripts/preflight-smoke.js",
+    "report": "node scripts/build-full-report.js",
+    "brief": "node scripts/build-brief.js",
+    "email": "powershell -NoProfile -File scripts/email-brief.ps1",
+    "enrich:entity": "node scripts/resolve-developer-entity.js",
+    "selfheal": "node scripts/pipeline-selfheal.js",
+    "learn": "node scripts/pipeline-learn.js",
+    "schedule": "powershell -NoProfile -File scripts/setup-weekly-schedule.ps1",
+    "mcp": "node mcp-server/index.js",
+    "agent:ceqa": "node agents/ceqa/index.js",
+    "agent:hcd": "node agents/hcd/index.js",
+    "agent:sb79": "node agents/sb79/index.js",
+    "agent:news": "node agents/developer-news/index.js",
+    "test": "node --test test/ 2>/dev/null || echo \"(no tests yet)\""
+  },
+  "dependencies": {
+    "@modelcontextprotocol/sdk": "^1.0.4",
+    "docx": "^9.6.1",
+    "dotenv": "^17.3.1",
+    "patchright": "^1.59.4",
+    "pdf-parse": "^1.1.4",
+    "playwright": "^1.58.2",
+    "playwright-extra": "^4.3.6",
+    "puppeteer-extra-plugin-stealth": "^2.11.2",
+    "xlsx": "^0.18.5",
+    "zod": "^3.23.8"
+  },
+  "optionalDependencies": {
+    "@anthropic-ai/sdk": "^0.32.1"
+  }
+}

@@ -1,0 +1,24 @@
+# Secrets — real values live ONLY in the OneDrive keys vault (das-leadgen.env)
+.env
+*.env
+!.env.example
+
+# Dependencies
+node_modules/
+package-lock.json
+
+# Run artifacts, caches, harvested data (regenerated every run)
+data/output/
+data/archive-index/*
+!data/archive-index/.gitkeep
+runs/
+*.log
+
+# Playwright / browser
+error-*.png
+*-screenshot.png
+.cache/
+
+# OS
+.DS_Store
+Thumbs.db

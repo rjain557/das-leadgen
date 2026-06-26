@@ -1,0 +1,48 @@
+{
+  "_comment": "Danielian Ideal Customer Profile (spec §4.2, §6). Project-type keywords, unit thresholds, and target geographies. Overrides the in-code defaults in agents/shared/danielian-fit.js — edit here to tune the ICP without touching code (spec §14 'config over code'). To override the project-type vocabularies, add a 'projectTypeKeywords' object mirroring the danielian-fit.js DEFAULTS.",
+  "version": "1.0",
+  "metros": {
+    "OC": {
+      "label": "Orange County",
+      "active": true,
+      "cities": [
+        "Irvine", "Santa Ana", "Anaheim", "Orange", "Tustin", "Garden Grove",
+        "Newport Beach", "Costa Mesa", "Huntington Beach", "Laguna Niguel",
+        "San Juan Capistrano", "San Clemente", "Dana Point", "County of Orange"
+      ]
+    },
+    "LA": {
+      "label": "Los Angeles",
+      "active": false,
+      "cities": ["Los Angeles", "LA County Unincorporated"]
+    },
+    "NASHVILLE": {
+      "label": "Nashville-Davidson",
+      "active": false,
+      "cities": ["Nashville-Davidson"]
+    }
+  },
+  "_pilotNote": "Pilot is OC-first (spec §1.3 / §16). LA activates in Phase 3, Nashville in Phase 4. Flip 'active' to true (and confirm in docs/phase-0-discovery.md item 1) to bring a metro online.",
+  "activeMetros": ["OC"],
+  "scale": {
+    "majorUnits": 200,
+    "midUnits": 50,
+    "smallUnits": 10
+  },
+  "aduBatchMinUnits": 4,
+  "minUnitsThreshold": 10,
+  "_minUnitsNote": "Floor for CEQA (L3) and HCD (L5) residential filtering — projects below this are dropped at harvest.",
+  "permitTypeKeywords": {
+    "_comment": "L1 permit filter — Danielian wants NEW multifamily/mixed-use/apartment/condo/townhome/ADU-batch/hotel-residential and large additions, NOT single-family rebuilds (the BBC target). These supplement danielian-fit classification.",
+    "include": [
+      "new multifamily", "apartment", "apartments", "condominium", "condo",
+      "townhome", "townhouse", "mixed use", "mixed-use", "mfr",
+      "residential units", "dwelling units", "hotel", "senior living",
+      "assisted living", "student housing", "affordable", "adu", "accessory dwelling"
+    ],
+    "exclude": [
+      "single family dwelling", "sfd", "custom home", "pool", "reroof",
+      "water heater", "tenant improvement", "solar", "hvac change-out"
+    ]
+  }
+}

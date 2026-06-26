@@ -1,0 +1,48 @@
+{
+  "_comment": "metro → city → portal vendor → URL → creds-key (spec §13.2). OC permit/portal vendors VERIFIED from the proven BBC agents (current as of 2026-06). LA/Nashville use Socrata open-data APIs. Per spec §4.1 footer: re-verify every per-jurisdiction vendor and Socrata dataset id in Phase 0 — they drift. 'verify' fields flag what must be confirmed before that source goes live.",
+  "version": "1.0",
+  "OC": [
+    { "city": "Irvine", "vendor": "custom-onbase", "permitUrl": "https://permits.cityofirvine.org/irvinepermits", "searchPath": "/Default.asp?Build=PM.pmPermit.SearchForm", "planningVendor": "granicus", "agent": "permits/oc/irvine", "credsKey": null, "verified": true },
+    { "city": "Newport Beach", "vendor": "energov", "permitUrl": "https://css.newportbeachca.gov/EnerGov_Prod/SelfService", "planningVendor": "granicus", "credsKey": "NEWPORT_BEACH", "verified": true },
+    { "city": "Costa Mesa", "vendor": "energov", "permitUrl": "https://permits.costamesaca.gov/energov_prod/selfservice", "planningVendor": "granicus", "credsKey": null, "verified": true },
+    { "city": "Huntington Beach", "vendor": "accela", "permitUrl": "https://engage.huntingtonbeachca.gov/CitizenAccess", "searchPath": "/Cap/CapHome.aspx", "planningVendor": "granicus", "credsKey": null, "verified": true },
+    { "city": "Laguna Niguel", "vendor": "energov", "permitUrl": "https://cityoflagunaniguelca-energovweb.tylerhost.net/apps/selfservice", "planningVendor": "granicus", "credsKey": null, "verified": true },
+    { "city": "San Juan Capistrano", "vendor": "etrakit", "permitUrl": "https://etrakit.sanjuancapistrano.org/etrakit", "searchPath": "/Search/permit.aspx", "credsKey": "SJC", "verified": true },
+    { "city": "San Clemente", "vendor": "etrakit", "permitUrl": "https://cdweb.san-clemente.org/etrakit", "searchPath": "/Search/permit.aspx", "credsKey": null, "verified": true },
+    { "city": "Dana Point", "vendor": "etrakit-csqr", "permitUrl": "https://dana.csqrcloud.com/community-etrakit", "searchPath": "/Search/project.aspx", "credsKey": "DANA_POINT", "verified": true },
+    { "city": "County of Orange", "vendor": "maintstar", "permitUrl": "https://h2.maintstar.co/orange", "credsKey": null, "verified": true },
+    { "city": "Santa Ana", "vendor": "verify", "permitUrl": "https://www.santa-ana.org/pba/", "planningVendor": "verify", "credsKey": null, "verified": false, "verify": "phase-0 — high-multifamily city; confirm portal vendor (likely Accela/eTRAKiT)" },
+    { "city": "Anaheim", "vendor": "verify", "permitUrl": "https://www.anaheim.net/", "planningVendor": "verify", "credsKey": null, "verified": false, "verify": "phase-0 — high-multifamily city; confirm portal vendor" },
+    { "city": "Orange", "vendor": "maintstar", "permitUrl": "https://h2.maintstar.co/orange", "credsKey": null, "verified": false, "verify": "phase-0 — confirm City of Orange Maintstar tenant vs County of Orange" },
+    { "city": "Tustin", "vendor": "verify", "permitUrl": "https://www.tustinca.org/", "credsKey": null, "verified": false, "verify": "phase-0 — confirm portal vendor" },
+    { "city": "Garden Grove", "vendor": "verify", "permitUrl": "https://ggcity.org/", "credsKey": null, "verified": false, "verify": "phase-0 — confirm portal vendor" }
+  ],
+  "LA": [
+    {
+      "city": "Los Angeles", "vendor": "socrata", "agent": "permits/la",
+      "permitUrl": "https://data.lacity.org/resource/pi9x-tg5x.json",
+      "dataset": "pi9x-tg5x",
+      "tokenKey": "LA_SOCRATA_APP_TOKEN",
+      "verified": true,
+      "verify": "VERIFIED LIVE 2026-06-26 — LADBS 'Building Permits' dataset pi9x-tg5x on data.lacity.org returns current data (latest issue_date 2026-06-21) via the SODA API. Columns: primary_address, apn, pin_nbr, permit_nbr, permit_type, permit_sub_type, use_desc, issue_date, status_desc, valuation, work_desc. App token optional (anonymous queries work). Re-confirm if it ever 0-returns."
+    },
+    {
+      "city": "LA County Unincorporated", "vendor": "accela-epic-la",
+      "permitUrl": "https://epicla.lacounty.gov/SelfService/",
+      "credsKey": null, "verified": false,
+      "verify": "phase-0 — EPIC-LA (Accela) for unincorporated LA County"
+    }
+  ],
+  "NASHVILLE": [
+    {
+      "city": "Nashville-Davidson", "vendor": "socrata", "agent": "permits/nashville",
+      "permitUrl": "https://permits.partner.socrata.com/resource/7ky7-xbzp.json",
+      "dataset": "7ky7-xbzp",
+      "tokenKey": "NASHVILLE_SOCRATA_APP_TOKEN",
+      "verified": false,
+      "verify": "DRIFT FOUND 2026-06-26 — the prior id data.nashville.gov/resource/3h5w-q8b7.json is DEAD (data.nashville.gov migrated to ArcGIS Hub; every /resource/<id>.json now 302s to hub.arcgis.com/legacy). The WORKING SODA feed is the Tyler Data & Insights BLDS partner host permits.partner.socrata.com/resource/7ky7-xbzp.json (standardized BLDS schema: permitnum, description, applieddate, issueddate, originaladdress1, permitclassmapped, workclassmapped, estprojectcostdec, contractorcompanyname). CAVEAT: partner feed's latest issueddate observed was stale (2016) — a short lookback may legitimately return 0 rows and the agent degrades to []. Phase-0: find a fresher live SODA/JSON endpoint (ArcGIS FeatureServer query or current Tyler BLDS id) and update here. App token optional.",
+      "previousDataset": "3h5w-q8b7",
+      "previousPermitUrl": "https://data.nashville.gov/resource/3h5w-q8b7.json"
+    }
+  ]
+}
