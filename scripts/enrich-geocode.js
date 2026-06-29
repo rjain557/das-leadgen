@@ -254,7 +254,12 @@ function applyGeocode(lead, geo) {
   lead.address.county = geo.county;
 }
 
-main().catch(err => {
-  console.error(err);
-  process.exit(1);
-});
+// Only auto-run as a CLI. The orchestrator require()s this module (tryModule),
+// so guard main() — otherwise require() parses the orchestrator's argv ("--days
+// 60" → reads a file named "60") and crashes the whole run with ENOENT.
+if (require.main === module) {
+  main().catch(err => {
+    console.error(err);
+    process.exit(1);
+  });
+}

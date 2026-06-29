@@ -6,10 +6,18 @@
  * Targets: Newport Beach, Costa Mesa, City of Orange
  */
 
-const { RESIDENTIAL_KEYWORDS, APPROVAL_KEYWORDS, DENIAL_KEYWORDS } = require('./config');
-const { parseDRBPdf } = require('./pdf-parser');
+const { RESIDENTIAL_KEYWORDS, APPROVAL_KEYWORDS, DENIAL_KEYWORDS, limits } = require('./config');
+const { parseDRBPdf, cleanName } = require('./pdf-parser');
 
 const LEGISTAR_API_BASE = 'https://webapi.legistar.com/v1';
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+function extractApn(text) {
+  if (!text) return '';
+  const m = text.match(/\bAPN[:\s]*([0-9]{3}[-\s]?[0-9]{2,3}[-\s]?[0-9]{2,3})/i)
+    || text.match(/Assessor\s+Parcel\s+Number[:\s]*([0-9]{3}[-\s]?[0-9]{2,3}[-\s]?[0-9]{2,3})/i);
+  return m ? m[1].replace(/\s+/g, '').trim() : '';
+}
 
 function matchesResidential(text) {
   const lower = (text || '').toLowerCase();
@@ -25,15 +33,15 @@ function detectRecommendation(text) {
 
 function extractAddress(text) {
   if (!text) return null;
-  const patterns = [
-    /(\d{1,6}\s+[A-Z][A-Za-z\s.]+(?:Street|St|Avenue|Ave|Boulevard|Blvd|Drive|Dr|Road|Rd|Lane|Ln|Way|Court|Ct|Circle|Cir|Place|Pl|Terrace|Ter|Trail|Trl)\.?(?:\s*,?\s*[A-Za-z\s]+,?\s*CA\s*\d{5})?)/i,
-    /(\d{1,6}\s+[A-Z][A-Za-z\s.]+(?:#\s*\d+)?)/i,
-  ];
-  for (const pattern of patterns) {
-    const match = text.match(pattern);
-    if (match) return match[1].trim();
-  }
-  return null;
+  // Prefer an explicit site-location label (NB/CM/Orange agendas use
+  // "Site Location: <addr>" / "Project Address: <addr>"); capture only up to a
+  // street suffix so we don't run into "Motion by …" trailing text.
+  const labeled = text.match(/(?:Site Location|Project (?:Address|Location|Site)|Property Address|Location)[:\s]+(\d{1,6}\s+[A-Za-z0-9.\s]+?\s+(?:Street|St|Avenue|Ave|Boulevard|Blvd|Drive|Dr|Road|Rd|Lane|Ln|Way|Court|Ct|Circle|Cir|Place|Pl|Terrace|Ter|Highway|Hwy|Parkway|Pkwy)\.?)/i);
+  if (labeled) return labeled[1].replace(/\s+/g, ' ').trim();
+  // Otherwise a bare street address — REQUIRE a recognized street suffix (no
+  // catch-all, which used to grab "30 units will be dist…").
+  const bare = text.match(/\b(\d{1,6}\s+[A-Z][A-Za-z]+(?:\s+[A-Za-z]+){0,4}\s+(?:Street|St|Avenue|Ave|Boulevard|Blvd|Drive|Dr|Road|Rd|Lane|Ln|Way|Court|Ct|Circle|Cir|Place|Pl|Terrace|Ter|Highway|Hwy|Parkway|Pkwy)\.?)\b/i);
+  return bare ? bare[1].replace(/\s+/g, ' ').trim() : null;
 }
 
 function extractCaseNumber(text) {
@@ -64,22 +72,24 @@ function extractApplicant(text) {
   ];
   for (const pattern of patterns) {
     const match = text.match(pattern);
-    if (match) return match[1].trim();
+    if (match) { const n = cleanName(match[1]); if (n) return n; }
   }
   return null;
 }
 
 function extractArchitect(text) {
   if (!text) return null;
+  // Require an explicit Architect/Designer label, OR a clear firm form
+  // ("X Architects" / "X, AIA"). The old catch-all that matched any text ending
+  // in "Design"/"Planning" produced false architectAlreadyNamed penalties.
   const patterns = [
-    /architect[:\s]+([A-Z][A-Za-z\s,.'&-]+?)(?:\.|,)/i,
-    /designer[:\s]+([A-Z][A-Za-z\s,.'&-]+?)(?:\.|,)/i,
-    /agent[:\s]+([A-Z][A-Za-z\s,.'&-]+?)(?:\.|,)/i,
-    /([A-Za-z\s.'&-]+(?:Architect|Architecture|Design|Planning)\b[A-Za-z\s.'&-]*)/i,
+    /architect[:\s]+([A-Z][A-Za-z\s,.'&-]+?)(?:\.|,|;)/i,
+    /designer[:\s]+([A-Z][A-Za-z\s,.'&-]+?)(?:\.|,|;)/i,
+    /\b([A-Z][A-Za-z&.\s]{2,40}\s(?:Architects?|Architecture|AIA))\b/,
   ];
   for (const pattern of patterns) {
     const match = text.match(pattern);
-    if (match) return match[1].trim();
+    if (match) { const n = cleanName(match[1]); if (n) return n; }
   }
   return null;
 }
@@ -92,13 +102,20 @@ function formatDate(dateStr) {
 }
 
 async function fetchJson(url) {
-  const response = await fetch(url, {
-    headers: { 'Accept': 'application/json' },
-  });
-  if (!response.ok) {
-    throw new Error(`HTTP ${response.status} for ${url}`);
+  const ac = new AbortController();
+  const timer = setTimeout(() => ac.abort(), (limits && limits.fetchTimeoutMs) || 20000);
+  try {
+    const response = await fetch(url, {
+      headers: { 'Accept': 'application/json' },
+      signal: ac.signal,
+    });
+    if (!response.ok) {
+      throw new Error(`HTTP ${response.status} for ${url}`);
+    }
+    return await response.json();
+  } finally {
+    clearTimeout(timer);
   }
-  return response.json();
 }
 
 /**
@@ -118,7 +135,8 @@ async function scrapeLegistar(cityConfig, options = {}) {
   try {
     // Step 1: Fetch recent events (meetings) for this body
     // Filter by date, get recent meetings
-    const eventsUrl = `${LEGISTAR_API_BASE}/${client}/events?$filter=EventDate ge datetime'${cutoffStr}'&$orderby=EventDate desc&$top=50`;
+    const topN = (limits && limits.legistarMaxEvents) || 40;
+    const eventsUrl = `${LEGISTAR_API_BASE}/${client}/events?$filter=EventDate ge datetime'${cutoffStr}'&$orderby=EventDate desc&$top=${topN}`;
     console.log(`[legistar] Fetching events: ${eventsUrl}`);
 
     const events = await fetchJson(eventsUrl);
@@ -206,11 +224,13 @@ async function scrapeLegistar(cityConfig, options = {}) {
 
           // Build the lead record
           const lead = {
-            source: 'drb',
+            source: 'planning-drb',
             sourceCity: cityConfig.slug,
             sourceName: cityConfig.name,
+            metro: 'OC',
             meetingDate,
             caseNumber: extractCaseNumber(fullText) || (matterDetails?.MatterFile || null),
+            apn: extractApn(fullText) || null,
             address: extractAddress(fullText),
             applicant: extractApplicant(fullText) || (matterDetails?.MatterName || null),
             architect: extractArchitect(fullText),
@@ -218,19 +238,20 @@ async function scrapeLegistar(cityConfig, options = {}) {
             recommendation: detectRecommendation(fullText),
             staffReportUrl,
             url: webUrl,
+            projectType: null, // consolidator/harness classifies
           };
 
           // If a staff report PDF is available, parse it for architect/owner info
           if (staffReportUrl && staffReportUrl.toLowerCase().endsWith('.pdf')) {
             try {
               console.log(`[legistar] Parsing staff report PDF: ${staffReportUrl.substring(0, 80)}...`);
-              const pdfData = await parseDRBPdf(staffReportUrl);
+              const pdfData = await parseDRBPdf(staffReportUrl, limits);
 
               // Merge PDF data — only overwrite if the field was empty
               if (pdfData.architect && !lead.architect) lead.architect = pdfData.architect;
               if (pdfData.owner && !lead.applicant) lead.applicant = pdfData.owner;
               if (pdfData.address && !lead.address) lead.address = pdfData.address;
-              if (pdfData.scope && lead.scope.length < 50) lead.scope = pdfData.scope;
+              if (pdfData.scope && (lead.scope || '').length < 50) lead.scope = pdfData.scope;
               // Store designer separately if different from architect
               if (pdfData.designer) lead.designer = pdfData.designer;
               if (pdfData.license) lead.architectLicense = pdfData.license;
@@ -244,6 +265,7 @@ async function scrapeLegistar(cityConfig, options = {}) {
       } catch (err) {
         console.warn(`[legistar] Error fetching items for event ${eventId}: ${err.message}`);
       }
+      await sleep((limits && limits.throttleMs) || 400);
     }
 
     console.log(`[legistar] ${cityConfig.slug}: extracted ${results.length} residential agenda items`);

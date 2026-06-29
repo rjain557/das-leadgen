@@ -1,553 +1,248 @@
 /**
- * City CMS Scraper — DRB Layer 2
+ * City-CMS Scraper — L2 (Dana Point, Laguna Niguel, San Clemente, County of Orange)
  *
- * Scrapes city-hosted agenda pages for planning commission/DRB meetings.
- * Uses Playwright for pages that require JS rendering.
- * Targets: San Clemente, Dana Point, Laguna Niguel, County of Orange
+ * These OC jurisdictions publish planning agendas on city-hosted CMSes (mostly
+ * CivicPlus "AgendaCenter", some CivicEngage). Rather than one bespoke function
+ * per city (the BBC approach, now drifted), this is a single generic flow:
+ *
+ *   1. Render the configured agendaUrl in a (stealth) browser.
+ *   2. Collect agenda links. CivicPlus exposes them as
+ *      /AgendaCenter/ViewFile/Agenda/_MMDDYYYY-<id>  (date is IN the URL — we
+ *      filter by --days from that, no fragile row-text parsing). Other CMSes:
+ *      any agenda/packet link or .pdf.
+ *   3. For each recent agenda (capped at limits.maxMeetingsPerCity): prefer the
+ *      HTML version (?html=true) parsed from the DOM; else download + pdf-parse.
+ *   4. Keep residential-development items; extract address / applicant / APN /
+ *      case# / scope.
+ *
+ * Graceful: a city that has drifted or blocks us returns [] (logged), never
+ * throws. Waits + counts capped so the run never hangs.
+ *
+ * PHASE-0 VERIFY: agendaUrl per city confirmed live 2026-06 (San Clemente moved
+ * to sanclemente.gov; County moved to pwds.oc.gov). Re-confirm if a city 0s out.
  */
 
-const { chromium } = require('playwright');
-const { browser: browserConfig, RESIDENTIAL_KEYWORDS, APPROVAL_KEYWORDS, DENIAL_KEYWORDS } = require('./config');
+const { launchBrowser } = require('../shared/browser');
+const { browser: browserConfig, RESIDENTIAL_KEYWORDS, APPROVAL_KEYWORDS, DENIAL_KEYWORDS, limits } = require('./config');
+const { parseAgendaPdfItems } = require('./pdf-parser');
 
 function matchesResidential(text) {
   const lower = (text || '').toLowerCase();
   return RESIDENTIAL_KEYWORDS.some(kw => lower.includes(kw));
 }
-
 function detectRecommendation(text) {
   const lower = (text || '').toLowerCase();
   if (APPROVAL_KEYWORDS.some(kw => lower.includes(kw))) return 'approval';
   if (DENIAL_KEYWORDS.some(kw => lower.includes(kw))) return 'denial';
   return null;
 }
-
-function extractAddress(text) {
-  if (!text) return null;
-  const patterns = [
-    /(\d{1,6}\s+[A-Z][A-Za-z\s.]+(?:Street|St|Avenue|Ave|Boulevard|Blvd|Drive|Dr|Road|Rd|Lane|Ln|Way|Court|Ct|Circle|Cir|Place|Pl|Terrace|Ter|Trail|Trl)\.?(?:\s*,?\s*[A-Za-z\s]+,?\s*CA\s*\d{5})?)/i,
-    /(\d{1,6}\s+[A-Z][A-Za-z\s.]+(?:#\s*\d+)?)/i,
-  ];
-  for (const pattern of patterns) {
-    const match = text.match(pattern);
-    if (match) return match[1].trim();
-  }
-  return null;
-}
-
 function extractCaseNumber(text) {
-  if (!text) return null;
+  if (!text) return '';
   const patterns = [
-    /\b(DR[PSC]?[-\s]?\d{2,4}[-\s]?\d{1,5})\b/i,
+    /\b(DR[PCS]?[-\s]?\d{2,4}[-\s]?\d{1,5})\b/i,
     /\b(PA[-\s]?\d{2,4}[-\s]?\d{1,5})\b/i,
     /\b(CDP[-\s]?\d{2,4}[-\s]?\d{1,5})\b/i,
     /\b(CUP[-\s]?\d{2,4}[-\s]?\d{1,5})\b/i,
-    /\b(VAR[-\s]?\d{2,4}[-\s]?\d{1,5})\b/i,
-    /\b(ZA[-\s]?\d{2,4}[-\s]?\d{1,5})\b/i,
+    /\b(TTM[-\s]?\d{2,5}(?:[-\s]?\d{1,4})?)\b/i,
+    /\b(TPM[-\s]?\d{2,5})\b/i,
+    /\b(AC[-\s]?\d{2,4}[-\s]?\d{1,5})\b/i,
+    /\b(GPA[-\s]?\d{2,4}[-\s]?\d{1,5})\b/i,
     /\b(SP[-\s]?\d{2,4}[-\s]?\d{1,5})\b/i,
+    /\b(ZC[-\s]?\d{2,4}[-\s]?\d{1,5})\b/i,
+    /\b(PLN[-\s]?\d{2,4}[-\s]?\d{1,5})\b/i,
   ];
-  for (const pattern of patterns) {
-    const match = text.match(pattern);
-    if (match) return match[1].trim().toUpperCase();
-  }
-  return null;
+  for (const p of patterns) { const m = text.match(p); if (m) return m[1].trim().toUpperCase(); }
+  return '';
 }
-
-function extractApplicant(text) {
-  if (!text) return null;
-  const patterns = [
-    /applicant[:\s]+([A-Z][A-Za-z\s,.'&-]+?)(?:\.|,\s*(?:for|to|requesting))/i,
-    /submitted by[:\s]+([A-Z][A-Za-z\s,.'&-]+?)(?:\.|,)/i,
-    /applicant[:\s]+([A-Z][A-Za-z\s,.'&-]{3,40})/i,
+function extractAddressInline(text) {
+  const pats = [
+    /\b(?:located at|at)\s+(\d{1,6}\s+[A-Z][A-Za-z]+(?:\s+[A-Za-z]+){0,4}\s+(?:Street|St|Avenue|Ave|Boulevard|Blvd|Drive|Dr|Road|Rd|Lane|Ln|Way|Court|Ct|Circle|Cir|Place|Pl|Terrace|Ter|Highway|Hwy|Parkway|Pkwy)\.?)/i,
+    /\b(\d{1,6}\s+[A-Z][A-Za-z]+(?:\s+[A-Za-z]+){0,4}\s+(?:Street|St|Avenue|Ave|Boulevard|Blvd|Drive|Dr|Road|Rd|Lane|Ln|Way|Court|Ct|Circle|Cir|Place|Pl|Terrace|Ter|Highway|Hwy|Parkway|Pkwy)\.?)\b/i,
   ];
-  for (const pattern of patterns) {
-    const match = text.match(pattern);
-    if (match) return match[1].trim();
-  }
-  return null;
+  for (const p of pats) { const m = text.match(p); if (m) return trimAddress(m[1]); }
+  return '';
 }
-
-function extractArchitect(text) {
-  if (!text) return null;
-  const patterns = [
-    /architect[:\s]+([A-Z][A-Za-z\s,.'&-]+?)(?:\.|,)/i,
-    /designer[:\s]+([A-Z][A-Za-z\s,.'&-]+?)(?:\.|,)/i,
-    /agent[:\s]+([A-Z][A-Za-z\s,.'&-]+?)(?:\.|,)/i,
-    /([A-Za-z\s.'&-]+(?:Architect|Architecture|Design|Planning)\b[A-Za-z\s.'&-]*)/i,
+function trimAddress(s) {
+  return String(s).replace(/\s+/g, ' ').trim()
+    .replace(/\s+(?:IN|AT|WITHIN|LOCATED)\b.*$/i, '')
+    .replace(/\s*[(,].*$/, '')
+    .trim();
+}
+function extractApn(text) {
+  const m = text.match(/\bAPN[:\s]*([0-9]{3}[-\s]?[0-9]{2,3}[-\s]?[0-9]{2,3})/i)
+    || text.match(/Assessor\s+Parcel\s+Number[:\s]*([0-9]{3}[-\s]?[0-9]{2,3}[-\s]?[0-9]{2,3})/i);
+  return m ? m[1].replace(/\s+/g, '').trim() : '';
+}
+function extractApplicantInline(text) {
+  const pats = [
+    /\(\s*Applicant[:\s]+([^)]{3,80}?)\)/i,
+    /ON BEHALF OF\s+([A-Z][A-Za-z0-9&.,'\s-]{3,70}?)(?:\.|;|$|\s{2,})/i,
+    /FILED BY\s+([A-Z][A-Za-z0-9&.,'\s-]{3,70}?)(?:,?\s+ON BEHALF OF|\.|;|$)/i,
+    /Applicant[:\s]+([A-Z][A-Za-z0-9&.,'\s-]{3,70}?)(?:\)|\.|;|\(Project)/i,
   ];
-  for (const pattern of patterns) {
-    const match = text.match(pattern);
-    if (match) return match[1].trim();
-  }
-  return null;
+  for (const p of pats) { const m = text.match(p); if (m) return m[1].replace(/\s+/g, ' ').trim().replace(/[,.]$/, ''); }
+  return '';
+}
+function extractArchitectInline(text) {
+  const m = text.match(/\b(?:Architect|Designer|Design Professional)[:\s]+([A-Z][A-Za-z0-9&.,'\s-]{3,60}?)(?:\)|\.|;|\(Project)/i);
+  return m ? m[1].replace(/\s+/g, ' ').trim().replace(/[,.]$/, '') : '';
+}
+const sleep = (ms) => new Promise(r => setTimeout(r, ms));
+
+// Date out of a CivicPlus ViewFile URL: /Agenda/_MMDDYYYY-<id>
+function dateFromCivicPlusUrl(href) {
+  const m = href.match(/_(\d{2})(\d{2})(\d{4})-/);
+  if (!m) return null;
+  const [, mm, dd, yyyy] = m;
+  const iso = `${yyyy}-${mm}-${dd}`;
+  const d = new Date(iso);
+  return isNaN(d.getTime()) ? null : iso;
 }
 
-function formatDate(dateStr) {
-  if (!dateStr) return null;
-  const d = new Date(dateStr);
-  if (isNaN(d.getTime())) return null;
-  return d.toISOString().split('T')[0];
-}
-
-/**
- * Scrape San Clemente DRS agenda page.
- * Uses folder-based agenda listing.
- */
-async function scrapeSanClemente(page, cityConfig, cutoffDate) {
-  const results = [];
-  console.log(`[city-cms] Scraping San Clemente DRS: ${cityConfig.agendaUrl}`);
-
-  await page.goto(cityConfig.agendaUrl, {
-    waitUntil: 'domcontentloaded',
-    timeout: browserConfig.navigationTimeout,
-  });
-  await page.waitForTimeout(3000);
-
-  // San Clemente uses a folder-style listing with links to agenda PDFs/pages
-  const agendaLinks = await page.$$eval('a', (links) => {
-    return links
-      .filter(a => {
-        const text = a.textContent.toLowerCase();
-        return (text.includes('agenda') || text.includes('packet') || /\d{4}/.test(text))
-          && a.href;
-      })
-      .map(a => ({
-        text: a.textContent.trim(),
-        href: a.href,
-      }));
-  });
-
-  console.log(`[city-cms] San Clemente: found ${agendaLinks.length} agenda links`);
-
-  // Visit each agenda page to extract items
-  for (const link of agendaLinks.slice(0, 10)) {
-    // Try to extract a date from the link text
-    const dateMatch = link.text.match(
-      /(\w+ \d{1,2},?\s*\d{4})|(\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4})/
-    );
-    const meetingDate = dateMatch ? formatDate(dateMatch[0]) : null;
-
-    if (meetingDate && new Date(meetingDate) < cutoffDate) continue;
-
-    // Skip PDF links, only visit HTML pages
-    if (link.href.endsWith('.pdf')) {
-      // Record the PDF link as a potential staff report
-      results.push({
-        source: 'drb',
-        sourceCity: cityConfig.slug,
-        sourceName: cityConfig.name,
-        meetingDate,
-        caseNumber: extractCaseNumber(link.text),
-        address: extractAddress(link.text),
-        applicant: null,
-        architect: null,
-        scope: link.text.substring(0, 300),
-        recommendation: null,
-        staffReportUrl: link.href,
-        url: cityConfig.agendaUrl,
-      });
-      continue;
-    }
-
-    try {
-      await page.goto(link.href, {
-        waitUntil: 'domcontentloaded',
-        timeout: browserConfig.navigationTimeout,
-      });
-      await page.waitForTimeout(2000);
-
-      const items = await page.$$eval(
-        'li, tr, p, .agenda-item, article',
-        (elems) => elems
-          .map(el => ({
-            text: (el.textContent || '').trim().substring(0, 1000),
-            links: Array.from(el.querySelectorAll('a')).map(a => ({
-              text: a.textContent.trim(),
-              href: a.href,
-            })),
-          }))
-          .filter(item => item.text.length > 30)
-      );
-
-      for (const item of items) {
-        if (!matchesResidential(item.text)) continue;
-
-        const pdfLink = item.links.find(l => l.href && l.href.endsWith('.pdf'));
-        results.push({
-          source: 'drb',
-          sourceCity: cityConfig.slug,
-          sourceName: cityConfig.name,
-          meetingDate,
-          caseNumber: extractCaseNumber(item.text),
-          address: extractAddress(item.text),
-          applicant: extractApplicant(item.text),
-          architect: extractArchitect(item.text),
-          scope: item.text.substring(0, 300).replace(/\s+/g, ' ').trim(),
-          recommendation: detectRecommendation(item.text),
-          staffReportUrl: pdfLink ? pdfLink.href : null,
-          url: link.href,
-        });
-      }
-    } catch (err) {
-      console.warn(`[city-cms] Error visiting ${link.href}: ${err.message}`);
-    }
-  }
-
-  return results;
-}
-
-/**
- * Scrape Dana Point Planning Commission page.
- */
-async function scrapeDanaPoint(page, cityConfig, cutoffDate) {
-  const results = [];
-  console.log(`[city-cms] Scraping Dana Point Planning: ${cityConfig.agendaUrl}`);
-
-  await page.goto(cityConfig.agendaUrl, {
-    waitUntil: 'domcontentloaded',
-    timeout: browserConfig.navigationTimeout,
-  });
-  await page.waitForTimeout(3000);
-
-  // Dana Point lists agendas as links with dates
-  const agendaLinks = await page.$$eval('a', (links) => {
-    return links
-      .filter(a => {
-        const text = a.textContent.toLowerCase();
-        return (text.includes('agenda') || text.includes('meeting') || text.includes('packet'))
-          && a.href;
-      })
-      .map(a => ({
-        text: a.textContent.trim(),
-        href: a.href,
-      }));
-  });
-
-  console.log(`[city-cms] Dana Point: found ${agendaLinks.length} agenda links`);
-
-  for (const link of agendaLinks.slice(0, 10)) {
-    const dateMatch = link.text.match(
-      /(\w+ \d{1,2},?\s*\d{4})|(\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4})/
-    );
-    const meetingDate = dateMatch ? formatDate(dateMatch[0]) : null;
-
-    if (meetingDate && new Date(meetingDate) < cutoffDate) continue;
-
-    if (link.href.endsWith('.pdf')) {
-      if (matchesResidential(link.text)) {
-        results.push({
-          source: 'drb',
-          sourceCity: cityConfig.slug,
-          sourceName: cityConfig.name,
-          meetingDate,
-          caseNumber: extractCaseNumber(link.text),
-          address: extractAddress(link.text),
-          applicant: null,
-          architect: null,
-          scope: link.text.substring(0, 300),
-          recommendation: null,
-          staffReportUrl: link.href,
-          url: cityConfig.agendaUrl,
-        });
-      }
-      continue;
-    }
-
-    try {
-      await page.goto(link.href, {
-        waitUntil: 'domcontentloaded',
-        timeout: browserConfig.navigationTimeout,
-      });
-      await page.waitForTimeout(2000);
-
-      const items = await page.$$eval(
-        'li, tr, p, .agenda-item, article, div.field-item',
-        (elems) => elems
-          .map(el => ({
-            text: (el.textContent || '').trim().substring(0, 1000),
-            links: Array.from(el.querySelectorAll('a')).map(a => ({
-              text: a.textContent.trim(),
-              href: a.href,
-            })),
-          }))
-          .filter(item => item.text.length > 30)
-      );
-
-      for (const item of items) {
-        if (!matchesResidential(item.text)) continue;
-        const pdfLink = item.links.find(l => l.href && l.href.endsWith('.pdf'));
-        results.push({
-          source: 'drb',
-          sourceCity: cityConfig.slug,
-          sourceName: cityConfig.name,
-          meetingDate,
-          caseNumber: extractCaseNumber(item.text),
-          address: extractAddress(item.text),
-          applicant: extractApplicant(item.text),
-          architect: extractArchitect(item.text),
-          scope: item.text.substring(0, 300).replace(/\s+/g, ' ').trim(),
-          recommendation: detectRecommendation(item.text),
-          staffReportUrl: pdfLink ? pdfLink.href : null,
-          url: link.href,
-        });
-      }
-    } catch (err) {
-      console.warn(`[city-cms] Error visiting ${link.href}: ${err.message}`);
-    }
-  }
-
-  return results;
-}
-
-/**
- * Scrape Laguna Niguel AgendaCenter page.
- * CivicPlus AgendaCenter pattern.
- */
-async function scrapeLagunaNiguel(page, cityConfig, cutoffDate) {
-  const results = [];
-  console.log(`[city-cms] Scraping Laguna Niguel Planning: ${cityConfig.agendaUrl}`);
-
-  await page.goto(cityConfig.agendaUrl, {
-    waitUntil: 'domcontentloaded',
-    timeout: browserConfig.navigationTimeout,
-  });
-  await page.waitForTimeout(3000);
-
-  // CivicPlus AgendaCenter lists agendas by year with toggle sections
-  // Each row has date, agenda PDF, minutes PDF, packet PDF links
-  const agendaRows = await page.$$eval(
-    'table tr, .Row, .AgendaRow, [class*="agenda"]',
-    (rows, cutoffStr) => {
-      const cutoff = new Date(cutoffStr);
-      return rows
-        .map(row => {
-          const text = row.textContent || '';
-          const dateMatch = text.match(
-            /(\w+ \d{1,2},?\s*\d{4})|(\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4})/
-          );
-          const links = Array.from(row.querySelectorAll('a')).map(a => ({
-            text: a.textContent.trim(),
-            href: a.href,
-          }));
-          return {
-            text: text.substring(0, 500),
-            date: dateMatch ? dateMatch[0] : null,
-            links,
-          };
-        })
-        .filter(row => {
-          if (!row.date) return false;
-          const d = new Date(row.date);
-          return !isNaN(d.getTime()) && d >= cutoff;
-        });
-    },
-    cutoffDate.toISOString()
-  );
-
-  console.log(`[city-cms] Laguna Niguel: found ${agendaRows.length} recent agenda rows`);
-
-  for (const row of agendaRows) {
-    const meetingDate = formatDate(row.date);
-    const agendaLink = row.links.find(l => {
-      const t = l.text.toLowerCase();
-      return t.includes('agenda') || t.includes('packet');
+// Split a block of agenda text into residential item records.
+function itemsFromText(bodyText) {
+  if (!bodyText || bodyText.length < 60) return [];
+  const segments = bodyText.split(/(?=\n\s*(?:\d{1,2}\.\s)|(?:ITEM\s+\d)|(?:[A-D]\.\d)|(?:CASE\s+(?:NO\.?|#)))/i);
+  const blocks = segments.length > 1 ? segments : [bodyText];
+  const out = [];
+  const seen = new Set();
+  for (const seg of blocks) {
+    const block = seg.replace(/\s+/g, ' ').trim();
+    if (block.length < 40) continue;
+    if (!matchesResidential(block)) continue;
+    const address = extractAddressInline(block);
+    const caseNumber = extractCaseNumber(block);
+    const apn = extractApn(block);
+    const isRoster = /\bChair\b[\s\S]{0,80}\bVice Chair\b[\s\S]{0,120}\bCommissioner\b/i.test(block);
+    if (isRoster && !caseNumber && !apn) continue;
+    const hasApplicantCue = /\(\s*Applicant[:\s]|FILED BY|ON BEHALF OF|\blocated at\b/i.test(block);
+    if (!caseNumber && !apn && !(address && hasApplicantCue)) continue;
+    const key = `${address}|${caseNumber}|${apn}`.toLowerCase();
+    if (seen.has(key)) continue;
+    seen.add(key);
+    out.push({
+      address, apn,
+      applicant: extractApplicantInline(block),
+      architect: extractArchitectInline(block),
+      caseNumber,
+      scope: block.slice(0, 300),
+      recommendation: detectRecommendation(block),
     });
-
-    if (!agendaLink) continue;
-
-    // If it's a PDF, note it but also try to visit HTML links
-    if (agendaLink.href.endsWith('.pdf')) {
-      results.push({
-        source: 'drb',
-        sourceCity: cityConfig.slug,
-        sourceName: cityConfig.name,
-        meetingDate,
-        caseNumber: null,
-        address: null,
-        applicant: null,
-        architect: null,
-        scope: `Planning Commission meeting agenda - ${row.date}`,
-        recommendation: null,
-        staffReportUrl: agendaLink.href,
-        url: cityConfig.agendaUrl,
-      });
-      continue;
-    }
-
-    try {
-      await page.goto(agendaLink.href, {
-        waitUntil: 'domcontentloaded',
-        timeout: browserConfig.navigationTimeout,
-      });
-      await page.waitForTimeout(2000);
-
-      const items = await page.$$eval(
-        'li, tr, p, .agenda-item',
-        (elems) => elems
-          .map(el => ({
-            text: (el.textContent || '').trim().substring(0, 1000),
-            links: Array.from(el.querySelectorAll('a')).map(a => ({
-              text: a.textContent.trim(),
-              href: a.href,
-            })),
-          }))
-          .filter(item => item.text.length > 30)
-      );
-
-      for (const item of items) {
-        if (!matchesResidential(item.text)) continue;
-        const pdfLink = item.links.find(l => l.href && l.href.endsWith('.pdf'));
-        results.push({
-          source: 'drb',
-          sourceCity: cityConfig.slug,
-          sourceName: cityConfig.name,
-          meetingDate,
-          caseNumber: extractCaseNumber(item.text),
-          address: extractAddress(item.text),
-          applicant: extractApplicant(item.text),
-          architect: extractArchitect(item.text),
-          scope: item.text.substring(0, 300).replace(/\s+/g, ' ').trim(),
-          recommendation: detectRecommendation(item.text),
-          staffReportUrl: pdfLink ? pdfLink.href : null,
-          url: agendaLink.href,
-        });
-      }
-    } catch (err) {
-      console.warn(`[city-cms] Error visiting ${agendaLink.href}: ${err.message}`);
-    }
+    if (out.length >= 40) break;
   }
-
-  return results;
+  return out;
 }
 
 /**
- * Scrape County of Orange Planning Commission page.
- */
-async function scrapeCountyOfOrange(page, cityConfig, cutoffDate) {
-  const results = [];
-  console.log(`[city-cms] Scraping County of Orange Planning: ${cityConfig.agendaUrl}`);
-
-  try {
-    await page.goto(cityConfig.agendaUrl, {
-      waitUntil: 'domcontentloaded',
-      timeout: browserConfig.navigationTimeout,
-    });
-    await page.waitForTimeout(3000);
-
-    // Look for planning commission / hearing links
-    const pcLinks = await page.$$eval('a', (links) => {
-      return links
-        .filter(a => {
-          const text = a.textContent.toLowerCase();
-          return (text.includes('planning') || text.includes('commission') || text.includes('hearing'))
-            && a.href;
-        })
-        .map(a => ({
-          text: a.textContent.trim(),
-          href: a.href,
-        }));
-    });
-
-    console.log(`[city-cms] County of Orange: found ${pcLinks.length} planning links`);
-
-    for (const link of pcLinks.slice(0, 5)) {
-      try {
-        await page.goto(link.href, {
-          waitUntil: 'domcontentloaded',
-          timeout: browserConfig.navigationTimeout,
-        });
-        await page.waitForTimeout(2000);
-
-        const items = await page.$$eval(
-          'li, tr, p, .agenda-item, article',
-          (elems) => elems
-            .map(el => ({
-              text: (el.textContent || '').trim().substring(0, 1000),
-              links: Array.from(el.querySelectorAll('a')).map(a => ({
-                text: a.textContent.trim(),
-                href: a.href,
-              })),
-            }))
-            .filter(item => item.text.length > 30)
-        );
-
-        for (const item of items) {
-          if (!matchesResidential(item.text)) continue;
-
-          const dateMatch = item.text.match(
-            /(\w+ \d{1,2},?\s*\d{4})|(\d{1,2}[\/-]\d{1,2}[\/-]\d{2,4})/
-          );
-          const meetingDate = dateMatch ? formatDate(dateMatch[0]) : null;
-          if (meetingDate && new Date(meetingDate) < cutoffDate) continue;
-
-          const pdfLink = item.links.find(l => l.href && l.href.endsWith('.pdf'));
-          results.push({
-            source: 'drb',
-            sourceCity: cityConfig.slug,
-            sourceName: cityConfig.name,
-            meetingDate,
-            caseNumber: extractCaseNumber(item.text),
-            address: extractAddress(item.text),
-            applicant: extractApplicant(item.text),
-            architect: extractArchitect(item.text),
-            scope: item.text.substring(0, 300).replace(/\s+/g, ' ').trim(),
-            recommendation: detectRecommendation(item.text),
-            staffReportUrl: pdfLink ? pdfLink.href : null,
-            url: link.href,
-          });
-        }
-      } catch (err) {
-        console.warn(`[city-cms] Error visiting ${link.href}: ${err.message}`);
-      }
-    }
-  } catch (err) {
-    console.error(`[city-cms] Error scraping County of Orange: ${err.message}`);
-  }
-
-  return results;
-}
-
-/**
- * Scrape a single city CMS site for DRB/Planning Commission agenda items.
+ * Generic city-CMS scraper.
+ * @returns {Promise<object[]>}
  */
 async function scrapeCityCms(cityConfig, options = {}) {
   const { days = 90, headed = false } = options;
   const cutoffDate = new Date();
   cutoffDate.setDate(cutoffDate.getDate() - days);
 
-  let browser;
-  let results = [];
+  const results = [];
+  let browserHandle;
 
   try {
-    browser = await chromium.launch({ headless: !headed });
-    const context = await browser.newContext({
+    const launched = await launchBrowser({ headed });
+    browserHandle = launched.browser;
+    const context = await browserHandle.newContext({
       viewport: browserConfig.viewport,
       userAgent: browserConfig.userAgent,
+      acceptDownloads: false,
     });
     const page = await context.newPage();
     page.setDefaultTimeout(browserConfig.timeout);
 
-    switch (cityConfig.slug) {
-      case 'san-clemente':
-        results = await scrapeSanClemente(page, cityConfig, cutoffDate);
-        break;
-      case 'dana-point':
-        results = await scrapeDanaPoint(page, cityConfig, cutoffDate);
-        break;
-      case 'laguna-niguel':
-        results = await scrapeLagunaNiguel(page, cityConfig, cutoffDate);
-        break;
-      case 'county-of-orange':
-        results = await scrapeCountyOfOrange(page, cityConfig, cutoffDate);
-        break;
-      default:
-        console.warn(`[city-cms] No scraper implemented for ${cityConfig.slug}`);
+    console.log(`[city-cms] ${cityConfig.name} (driver=${launched.driver}) -> ${cityConfig.agendaUrl}`);
+    await page.goto(cityConfig.agendaUrl, { waitUntil: 'domcontentloaded', timeout: browserConfig.navigationTimeout });
+    await page.waitForTimeout(3500);
+
+    // Collect candidate agenda links (CivicPlus ViewFile + generic agenda/packet/pdf).
+    const links = await page.$$eval('a', (as) => as
+      .map(a => ({ text: (a.textContent || '').replace(/\s+/g, ' ').trim(), href: a.href }))
+      .filter(l => l.href && (/ViewFile\/Agenda|_Agenda_|\/Agenda\//i.test(l.href) || /\.pdf/i.test(l.href) || /agenda|packet/i.test(l.text))));
+
+    // Build a deduped, date-filtered work list. Prefer CivicPlus ViewFile agendas
+    // (date in URL). Drop obvious "minutes"/"packet-only" duplicates.
+    const work = [];
+    const seenUrl = new Set();
+    for (const l of links) {
+      const isCivicPlus = /ViewFile\/Agenda/i.test(l.href);
+      const iso = isCivicPlus ? dateFromCivicPlusUrl(l.href) : null;
+      if (iso && new Date(iso) < cutoffDate) continue;
+      // Skip pure-minutes links.
+      if (/minutes/i.test(l.text) && !/agenda/i.test(l.text)) continue;
+      // Normalize CivicPlus to the HTML view for easy parsing.
+      let url = l.href;
+      if (isCivicPlus && !/html=true/i.test(url) && !/packet=true/i.test(url)) url = url + (url.includes('?') ? '&' : '?') + 'html=true';
+      if (seenUrl.has(url)) continue;
+      seenUrl.add(url);
+      work.push({ url, iso, isCivicPlus, isPdf: /\.pdf(\?|$)/i.test(l.href) && !isCivicPlus });
+      if (work.length >= limits.maxMeetingsPerCity) break;
+    }
+
+    console.log(`[city-cms] ${cityConfig.slug}: ${links.length} agenda links, ${work.length} within ${days}d (cap ${limits.maxMeetingsPerCity})`);
+
+    for (const w of work) {
+      let items = [];
+      // HTML agenda (CivicPlus ?html=true, or a non-PDF agenda page): render + parse DOM.
+      if (!w.isPdf) {
+        try {
+          await page.goto(w.url, { waitUntil: 'domcontentloaded', timeout: browserConfig.navigationTimeout });
+          await page.waitForTimeout(1500);
+          const bodyText = await page.evaluate(() => document.body.innerText || '');
+          items = itemsFromText(bodyText);
+        } catch (err) {
+          // Some CivicPlus "html=true" links still stream a PDF -> goto throws
+          // "Download is starting". Fall through to the PDF path.
+          if (!/download/i.test(String(err.message))) {
+            console.warn(`[city-cms] ${cityConfig.slug}: HTML agenda error: ${String(err.message).slice(0, 60)}`);
+          }
+        }
+      }
+      // PDF path (or HTML yielded nothing): download + pdf-parse.
+      if (items.length === 0) {
+        const pdfUrl = w.url.replace(/([?&])html=true(&|$)/i, '$1').replace(/[?&]$/, '');
+        try {
+          const pdfItems = await parseAgendaPdfItems(pdfUrl, {
+            matchesResidential, extractCaseNumber, detectRecommendation, limits,
+          });
+          items = pdfItems.map(it => ({ ...it, apn: extractApn(it.scope || '') }));
+        } catch (err) {
+          console.warn(`[city-cms] ${cityConfig.slug}: PDF parse error: ${String(err.message).slice(0, 60)}`);
+        }
+      }
+
+      for (const it of items) {
+        results.push({
+          source: 'planning-drb',
+          sourceCity: cityConfig.slug,
+          sourceName: cityConfig.name,
+          metro: 'OC',
+          meetingDate: w.iso || null,
+          caseNumber: it.caseNumber || null,
+          apn: it.apn || null,
+          address: it.address || null,
+          applicant: it.applicant || null,
+          architect: it.architect || null,
+          scope: it.scope || null,
+          recommendation: it.recommendation || null,
+          staffReportUrl: w.url,
+          url: w.url,
+          projectType: null,
+        });
+      }
+      await sleep(limits.throttleMs);
     }
 
     console.log(`[city-cms] ${cityConfig.slug}: extracted ${results.length} residential agenda items`);
   } catch (err) {
-    console.error(`[city-cms] Error scraping ${cityConfig.slug}: ${err.message}`);
+    console.error(`[city-cms] ${cityConfig.slug}: FAILED - ${String(err.message).slice(0, 120)}`);
   } finally {
-    if (browser) await browser.close();
+    if (browserHandle) { try { await browserHandle.close(); } catch { /* ignore */ } }
   }
 
   return results;

@@ -72,6 +72,38 @@ function buildDossiers(tier1, news) {
   return [...byDev.values()].sort((a, b) => b.pursuits.length - a.pursuits.length);
 }
 
+// Land & Entitlement Watch — the L2/L4 payoff. Pursuits below Tier-1 that still
+// carry a real developer NAME because a deed was recorded (L4 grantee) or a
+// planning/design-review item was filed (L2 applicant). These are named accounts
+// acquiring/entitling land in the active markets RIGHT NOW — warm them early,
+// even though they're pre-unit-count and so don't out-score the HCD/SB79 leads.
+function buildWatchlist(leads) {
+  const isL = (lead, code) => (lead.sources || []).some(s => new RegExp(`^${code}\\b`, 'i').test(String(s.layer || '')));
+  const named = leads.filter(l => l.tier >= 2 && l.developer && l.developer.rawName && (isL(l, 'L2') || isL(l, 'L4')));
+  const byDev = new Map();
+  for (const lead of named) {
+    const dev = lead.developer.resolvedEntity || lead.developer.rawName;
+    const e = byDev.get(dev) || { developer: dev, pursuits: [], contacts: [] };
+    e.pursuits.push(lead);
+    if (Array.isArray(lead.contacts)) e.contacts.push(...lead.contacts);
+    byDev.set(dev, e);
+  }
+  for (const e of byDev.values()) {
+    const seen = new Set();
+    e.contacts = e.contacts.filter(c => { const k = `${c.name}|${c.email}`.toLowerCase(); if (seen.has(k)) return false; seen.add(k); return true; }).slice(0, 4);
+  }
+  // Developers with a resolved contact first, then by number of signals.
+  return [...byDev.values()].sort((a, b) => (b.contacts.length - a.contacts.length) || (b.pursuits.length - a.pursuits.length));
+}
+
+function renderWatchPursuit(p) {
+  const isDeed = (p.sources || []).some(s => /^L4\b/i.test(String(s.layer || '')));
+  const date = (p.sources && p.sources[0] && p.sources[0].date) || '';
+  const what = isDeed ? 'Recorded a grant deed' : 'On a planning / design-review agenda';
+  const loc = p.address ? ` — ${esc(p.address)}` : ` (${esc(p.jurisdiction || p.metro || 'OC')})`;
+  return `<li>${esc(what)}${loc}${date ? ` <span class="muted">· ${esc(date)}</span>` : ''} <span class="muted">${sourceBadges(p)}</span></li>`;
+}
+
 function renderBrief(doc, news) {
   const meta = doc.meta || {};
   const leads = (doc.leads || []).filter(l => l.tier > 0);
@@ -80,6 +112,7 @@ function renderBrief(doc, news) {
   const runDate = meta.runDate || new Date().toISOString().slice(0, 10);
   const newT1 = tier1.filter(l => l.firstSeen === runDate);
   const dossiers = buildDossiers(tier1, news);
+  const watch = buildWatchlist(leads).slice(0, 25);
 
   const cards = tier1.map(l => `
     <div class="card">
@@ -106,6 +139,13 @@ function renderBrief(doc, news) {
       ${d.contacts && d.contacts.length ? `<div class="contacts"><strong>Decision-makers:</strong><ul>${d.contacts.map(c => `<li>${esc(c.name || '')}${c.title ? `, ${esc(c.title)}` : ''}${c.email ? ` — <a href="mailto:${esc(c.email)}">${esc(c.email)}</a>` : ''}${c.phone ? ` · ${esc(c.phone)}` : ''}</li>`).join('')}</ul></div>` : ''}
       <ul>${d.pursuits.map(p => `<li>${esc(p.address || p.jurisdiction)} — ${esc(fmtType(p.projectType))}${p.unitCount ? `, ${esc(p.unitCount)} units` : ''} (${esc(fmtStage(p.stage))})${p.owner && p.owner.name ? ` · owner: ${esc(p.owner.name)}` : ''}</li>`).join('')}</ul>
       ${d.news && d.news.length ? `<div class="news"><strong>Recent news:</strong><ul>${d.news.map(n => `<li><a href="${esc(n.url)}">${esc(n.headline)}</a> <span class="muted">${esc(n.source || '')}</span></li>`).join('')}</ul></div>` : ''}
+    </div>`).join('');
+
+  const watchHtml = watch.map(w => `
+    <div class="dossier">
+      <div class="dossier-head">${esc(w.developer)} <span class="muted">— ${w.pursuits.length} signal${w.pursuits.length > 1 ? 's' : ''}</span></div>
+      ${w.contacts && w.contacts.length ? `<div class="contacts"><strong>Contact:</strong><ul>${w.contacts.map(c => `<li>${esc(c.name || '')}${c.title ? `, ${esc(c.title)}` : ''}${c.email ? ` — <a href="mailto:${esc(c.email)}">${esc(c.email)}</a>` : ''}${c.phone ? ` · ${esc(c.phone)}` : ''}${c.source === 'ca-sos' && !c.email ? ' <span class="muted">(registered agent — entity principal)</span>' : ''}</li>`).join('')}</ul></div>` : ''}
+      <ul>${w.pursuits.map(renderWatchPursuit).join('')}</ul>
     </div>`).join('');
 
   return `<!DOCTYPE html><html><head><meta charset="utf-8"><meta name="viewport" content="width=device-width,initial-scale=1">
@@ -149,6 +189,9 @@ function renderBrief(doc, news) {
   </div>
   <div class="section"><h2>Tier 1 — act now</h2>${cards || '<p class="muted">No Tier-1 pursuits this run.</p>'}</div>
   <div class="section"><h2>Account dossiers</h2>${dossierHtml || '<p class="muted">No dossiers this run.</p>'}</div>
+  <div class="section"><h2>Land &amp; entitlement watch — named developers</h2>
+    <p class="muted" style="margin:-8px 0 14px;font-size:13px">Named developers who just recorded a land deed or appeared on a planning / design-review agenda in your markets — the earliest named-account signals, ahead of the unit-count stage. Warm these relationships now.</p>
+    ${watchHtml || '<p class="muted">No named-developer signals this run.</p>'}</div>
   <div class="foot">
     Generated by Danielian Pursuit Intelligence. Run ${esc(meta.runId || runDate)} ·
     ${esc(meta.rawCount || 0)} raw signals → ${esc(meta.deduped || leads.length)} unique pursuits ·

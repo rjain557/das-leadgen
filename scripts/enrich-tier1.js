@@ -195,7 +195,12 @@ async function apolloMatch(person, cache) {
     if (!res.ok) return null;
     const data = await res.json();
     const m = data.person || {};
-    const out = { email: m.email || '', phone: (m.phone_numbers && m.phone_numbers[0] && m.phone_numbers[0].sanitized_number) || '' };
+    const out = {
+      email: m.email || '',
+      phone: (m.phone_numbers && m.phone_numbers[0] && m.phone_numbers[0].sanitized_number) || '',
+      title: m.title || '',
+      linkedin: m.linkedin_url || '',
+    };
     cache[ck] = out; return out;
   } catch { return null; }
 }
@@ -217,13 +222,51 @@ async function apolloContacts(ownerName, cache) {
   return out;
 }
 
+// --- Harvest-layer developer name → contacts (the L2/L4 payoff) -------------
+// Consolidation writes the planning APPLICANT (L2) / deed GRANTEE (L4) into
+// lead.developer.rawName. That named developer/person is usually a better lead
+// than the ATTOM SPE owner-of-record, and unlike the owner it exists even when
+// ATTOM has no record for the (pre-development) parcel. Resolve it to a contact:
+// a real person → Apollo people/match directly; an opaque LLC → bizfile (→
+// registered agent) → Apollo match (the same two-step used for ATTOM owners).
+function splitPersonOrg(name) {
+  const s = String(name || '').trim();
+  // "Dean Pernicone with D.R. Horton" / "Jane Doe, ABC Capital" / "Bob Lee / XYZ"
+  const m = s.match(/^([A-Z][A-Za-z.'’-]+(?:\s+[A-Z][A-Za-z.'’-]+){1,2})\s+(?:with|of|for|,|\/|at)\s+(.+)$/);
+  if (m && !isCorporate(m[1])) return { person: m[1].trim(), org: m[2].replace(/^the\s+/i, '').trim() };
+  // Bare two/three-word person name with no corporate suffix.
+  if (/^[A-Z][A-Za-z.'’-]+(?:\s+[A-Z][A-Za-z.'’-]+){1,2}$/.test(s) && !isCorporate(s)) return { person: s, org: '' };
+  return { person: '', org: s };
+}
+
+async function resolveNamedDeveloper(lead, name, casCache, enrichCache) {
+  const { person, org } = splitPersonOrg(name);
+  // Person → Apollo people/match (this plan allows match; people-search is gated).
+  if (person) {
+    const parts = person.split(/\s+/).filter(Boolean);
+    if (parts.length >= 2) {
+      const m = await apolloMatch({ first_name: parts[0], last_name: parts.slice(1).join(' '), name: person, org: org || name }, enrichCache);
+      if (m && ((m.email && !masked(m.email)) || m.phone)) {
+        const c = makeContact({ role: 'developer-exec', name: person, firmName: org || name, title: m.title || '', email: masked(m.email) ? '' : m.email, phone: m.phone || '', source: 'apollo', confidence: 'high' });
+        if (c) { if (m.linkedin) c.linkedin = m.linkedin; c.emailSource = 'apollo'; lead.contacts = mergeContacts(lead.contacts, [c]); return true; }
+      }
+    }
+  }
+  // Opaque LLC / holding entity → bizfile → registered agent → Apollo match.
+  if (isCorporate(org || name)) {
+    const res = await bizfileFallback(lead, org || name, casCache, enrichCache);
+    return !!res;
+  }
+  return false;
+}
+
 // CA SOS bizfile fallback: when Apollo yields nothing for a corporate owner,
 // resolve the owner LLC → registered agent (a real human for ~half of opaque
 // SPEs) + entity metadata from the FREE public bizfile search. Adds a contact
 // only when the agent is a real person (not a commercial registered-agent
 // service); always records the entity metadata on lead.developer.caSos.
 // Returns true if a real (non-commercial) bizfile contact was added.
-async function bizfileFallback(lead, ownerName, casCache) {
+async function bizfileFallback(lead, ownerName, casCache, enrichCache) {
   let resolved = null;
   try {
     resolved = await caSos.resolveEntity(ownerName, { cache: casCache });
@@ -264,8 +307,25 @@ async function bizfileFallback(lead, ownerName, casCache) {
   if (!c) return false;
   c.title = 'Registered Agent';
   if (resolved.sourceUrl) c.sourceUrl = resolved.sourceUrl;
+
+  // Enrich the real human with email/phone via Apollo people/match. This Apollo
+  // plan allows match (not people-search), so bizfile supplies the NAME and
+  // Apollo supplies the contact — the two-step "resolve entity → enrich person".
+  let apolloEnriched = false;
+  const parts = String(agent.name).trim().split(/\s+/).filter(Boolean);
+  if (enrichCache && parts.length >= 2 && process.env.APOLLO_API_KEY) {
+    const person = { first_name: parts[0], last_name: parts.slice(1).join(' '), name: agent.name, org: resolved.entityName || ownerName };
+    const m = await apolloMatch(person, enrichCache);
+    if (m) {
+      if (m.title) c.title = m.title;                 // upgrade from "Registered Agent" to real title
+      if (m.email && !masked(m.email)) { c.email = m.email; apolloEnriched = true; }
+      if (m.phone) c.phone = m.phone;
+      if (m.linkedin) c.linkedin = m.linkedin;
+      if (apolloEnriched || m.phone) c.emailSource = 'apollo';
+    }
+  }
   lead.contacts = mergeContacts(lead.contacts, [c]);
-  return true;
+  return { apolloEnriched };
 }
 
 async function main() {
@@ -273,15 +333,23 @@ async function main() {
   if (!file) { console.error('No full-run JSON.'); process.exit(1); }
   const doc = JSON.parse(fs.readFileSync(file, 'utf8'));
   const tier1 = (doc.leads || []).filter(l => l.tier === 1);
-  console.log(`[enrich-tier1] enriching ${tier1.length} Tier-1 pursuits (ATTOM → Apollo → bizfile → entity)…`);
+  // Also enrich lower-tier pursuits that carry a real developer NAME from the L2
+  // planning (applicant) / L4 deeds (grantee) layers. Those NAMES are the entire
+  // reason those layers exist, and they only become contacts if we enrich them —
+  // and the current Tier-1 set is HCD/SB79-dominated and largely name-less. Cap
+  // to bound API/runtime; doc.leads is score-sorted so Tier-2 are taken first.
+  const namedLower = (doc.leads || []).filter(l => l.tier > 1 && l.developer && l.developer.rawName &&
+    (l.sources || []).some(s => /^L[24]\b|planning|deed/i.test(String(s.layer || '')))).slice(0, 45);
+  const targets = tier1.concat(namedLower);
+  console.log(`[enrich-tier1] enriching ${tier1.length} Tier-1 + ${namedLower.length} named L2/L4 pursuits = ${targets.length} total (ATTOM → Apollo → bizfile → entity)…`);
   const cache = loadCache();
   // bizfile keeps its own on-disk cache (data/output/ca-sos-cache.json). Load it
   // once and pass it through so all lookups share it; persist once at the end.
   const casCache = caSos.loadCacheFile();
-  let withOwner = 0, withContacts = 0, attomHits = 0, bizfileResolved = 0;
+  let withOwner = 0, withContacts = 0, attomHits = 0, bizfileResolved = 0, namedDevResolved = 0;
 
-  for (let i = 0; i < tier1.length; i++) {
-    const lead = tier1[i];
+  for (let i = 0; i < targets.length; i++) {
+    const lead = targets[i];
     // Clear prior discovery-sourced contacts so re-runs don't accumulate noise.
     lead.contacts = (lead.contacts || []).filter(c => c.source !== 'hunter' && c.source !== 'apollo' && c.source !== 'ca-sos');
     const a = await attomLookup(lead, cache);
@@ -293,19 +361,26 @@ async function main() {
       if (a.ownerName) withOwner++;
       if (a.corporate && a.ownerName) {
         lead.developer = Object.assign({ rawName: a.ownerName, isLLC: true }, lead.developer || {});
-        // Apollo: org → development decision-makers (titles), with capped reveal.
-        const contacts = await apolloContacts(a.ownerName, cache);
-        if (contacts.length) { lead.contacts = mergeContacts(lead.contacts, contacts); withContacts++; }
-        // Fallback for opaque local LLCs Apollo can't crack: CA SOS bizfile →
-        // registered agent (real human ~half the time) + entity metadata. FREE.
-        else {
-          const added = await bizfileFallback(lead, a.ownerName, casCache);
-          if (added) bizfileResolved++;
-        }
+        // bizfile (LLC → real human registered agent) + Apollo people/match
+        // (→ that human's email/phone/title). Apollo people-SEARCH is gated on
+        // this plan tier; match works, fed by the bizfile name.
+        const res = await bizfileFallback(lead, a.ownerName, casCache, cache);
+        if (res) { bizfileResolved++; if (res.apolloEnriched) withContacts++; }
       }
     }
+    // L2/L4 payoff: when ATTOM didn't already yield a contact, resolve the
+    // harvest-layer developer NAME (planning applicant / deed grantee). This is
+    // what converts the newly-online L2/L4 names into real emails/phones, and it
+    // fires even when ATTOM has no record for the (pre-development) parcel.
+    const harvestDev = lead.developer && lead.developer.rawName;
+    const ownerName = lead.owner && lead.owner.name;
+    const haveContact = (lead.contacts || []).some(c => c.source === 'apollo' || c.source === 'ca-sos');
+    if (harvestDev && !haveContact && harvestDev !== ownerName) {
+      const got = await resolveNamedDeveloper(lead, harvestDev, casCache, cache);
+      if (got) { namedDevResolved++; withContacts++; }
+    }
     saveCache(cache);
-    if ((i + 1) % 5 === 0) console.log(`  …${i + 1}/${tier1.length}`);
+    if ((i + 1) % 5 === 0) console.log(`  …${i + 1}/${targets.length}`);
     await sleep(250);
   }
   // Persist the bizfile cache once and release the headless browser session.
@@ -313,10 +388,10 @@ async function main() {
   await caSos.closeSession();
 
   // LLC → principal + Danielian archive cross-ref (the relationship flag)
-  await entity.enrichLeads(tier1);
+  await entity.enrichLeads(targets);
 
   fs.writeFileSync(file, JSON.stringify(doc, null, 2));
-  console.log(`[enrich-tier1] done. ATTOM hits=${attomHits}/${tier1.length}, owner names=${withOwner}, pursuits with Apollo contacts=${withContacts}, bizfile resolved=${bizfileResolved}, Apollo email-reveals used=${_apolloReveals}/${APOLLO_REVEAL_CAP}.`);
+  console.log(`[enrich-tier1] done. enriched=${targets.length} (T1=${tier1.length}+named=${namedLower.length}), ATTOM hits=${attomHits}, owner names=${withOwner}, pursuits with contacts=${withContacts}, bizfile resolved=${bizfileResolved}, named-developer (L2/L4) resolved=${namedDevResolved}, Apollo email-reveals used=${_apolloReveals}/${APOLLO_REVEAL_CAP}.`);
   console.log(`  Updated ${path.basename(file)}. Run "npm run brief" to render dossiers with owners + contacts.`);
 }
 

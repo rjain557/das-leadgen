@@ -325,7 +325,12 @@ async function resolveEntity(name, opts = {}) {
 
   const cache = opts.cache || loadCache();
   if (!opts.noCache && Object.prototype.hasOwnProperty.call(cache, key)) {
-    return cache[key];
+    const cached = cache[key];
+    // A genuine cached miss is stored as { notFound:true }; return null for it.
+    if (cached && cached.notFound) return null;
+    // A non-null hit → return it. A bare `null` (legacy/poisoned transient) is
+    // NOT a durable answer → fall through and re-resolve.
+    if (cached) return cached;
   }
 
   // Default 0.55: rejects partial/wrong-company matches (e.g. "WEST ST
@@ -333,26 +338,39 @@ async function resolveEntity(name, opts = {}) {
   // exact + acronym + minor-suffix matches (KHIK 1.0, ORANGE 702 0.82). A missing
   // contact is better than a wrong one for a client-facing ABM brief.
   const minMatch = typeof opts.minMatch === 'number' ? opts.minMatch : 0.55;
-  let result = null;
+  let outcome = 'transient', result = null;
   try {
-    result = await searchLive(raw, minMatch);
+    const r = await searchLive(raw, minMatch);
+    outcome = r.outcome; result = r.data;
   } catch (e) {
-    // NEVER throw — log + degrade.
+    // NEVER throw — log + degrade. Treated as transient (don't poison the cache).
     console.warn(`  [ca-sos] resolveEntity("${raw}") error: ${e.message}`);
-    result = null;
+    outcome = 'transient'; result = null;
   }
 
-  // Cache both hits and clean misses (null) so re-runs are cheap. A null caches a
-  // "looked, found nothing" — acceptable; clear ca-sos-cache.json to force re-look.
-  cache[key] = result;
-  if (!opts.cache) saveCache(cache); // only auto-persist when we own the cache
+  // Cache HITs and genuine MISSes ("searched OK, no match") so re-runs are cheap.
+  // Misses are stored as a sentinel { notFound:true } (NOT bare null) so a poisoned
+  // legacy null is never mistaken for a durable miss. Do NOT cache TRANSIENT
+  // failures (browser unavailable / HTTP non-200 / Imperva block) — caching those
+  // would wrongly suppress a later successful resolution.
+  if (outcome === 'hit') {
+    cache[key] = result;
+    if (!opts.cache) saveCache(cache);
+  } else if (outcome === 'miss') {
+    cache[key] = { notFound: true, resolvedAt: new Date().toISOString() };
+    if (!opts.cache) saveCache(cache);
+  }
   return result;
 }
 
 // Perform one live search against the warm session and shape the result.
+// Returns { outcome: 'hit'|'miss'|'transient', data: <result|null> }.
+//   hit       — resolved an entity (data = result object)
+//   miss      — searched fine, no acceptable match (data = null) → cacheable
+//   transient — couldn't search (browser down / HTTP error) (data = null) → NOT cached
 async function searchLive(raw, minMatch) {
   const session = await ensureSession();
-  if (!session) return null;
+  if (!session) return { outcome: 'transient', data: null };
   const { page } = session;
 
   // Polite spacing.
@@ -373,27 +391,30 @@ async function searchLive(raw, minMatch) {
     await page.keyboard.press('Enter');
     const resp = await waitResp;
     if (resp) { status = resp.status(); try { body = await resp.text(); } catch { /* ignore */ } }
-  } finally {
+  } catch (e) {
     searchLive._last = Date.now();
+    console.warn(`  [ca-sos] search "${raw}" interaction failed (${e.message}); transient.`);
+    return { outcome: 'transient', data: null };
   }
+  searchLive._last = Date.now();
 
   if (status !== 200 || !body) {
     if (status && status !== 200) console.warn(`  [ca-sos] search "${raw}" → HTTP ${status} (Imperva/transient); skipping.`);
-    return null;
+    return { outcome: 'transient', data: null }; // no response / blocked → don't cache
   }
 
   const rows = rowsFromBody(body);
-  if (!rows.length) return null;
+  if (!rows.length) return { outcome: 'miss', data: null }; // searched OK, genuinely nothing
 
   const best = pickBestRow(rows, raw);
-  if (!best) return null;
+  if (!best) return { outcome: 'miss', data: null };
 
   // Guard against weak fuzzy matches (e.g. "WEST ST INVESTMENTS" matching
   // "WEST COAST STRATEGIC INVESTMENTS"): require a minimum token overlap, else
   // treat as not-found rather than surfacing a wrong company.
   if (best.sim < minMatch) {
     console.warn(`  [ca-sos] best match for "${raw}" was "${best.r.entityName}" (similarity ${best.sim.toFixed(2)} < ${minMatch}); treating as not-found.`);
-    return null;
+    return { outcome: 'miss', data: null }; // looked, no acceptable match → cacheable
   }
 
   const r = best.r;
@@ -404,19 +425,22 @@ async function searchLive(raw, minMatch) {
     : null;
 
   return {
-    entityName: r.entityName,
-    entityNumber: r.entityNumber,
-    status: r.status,
-    entityType: r.entityType,
-    registrationDate: r.registrationDate,
-    standing: r.standing,
-    agent,                       // { name, address:'' (detail login-gated), isCommercial }
-    principals: [],              // login/PDF-gated — see LIMITATION note at top
-    jurisdiction: r.jurisdiction || 'CALIFORNIA',
-    matchSimilarity: Number(best.sim.toFixed(2)),
-    sourceUrl: `${SOURCE_BASE}?SearchType=BUSINESS&SearchCriteria=${encodeURIComponent(r.entityName)}`,
-    source: 'ca-sos',
-    resolvedAt: new Date().toISOString(),
+    outcome: 'hit',
+    data: {
+      entityName: r.entityName,
+      entityNumber: r.entityNumber,
+      status: r.status,
+      entityType: r.entityType,
+      registrationDate: r.registrationDate,
+      standing: r.standing,
+      agent,                       // { name, address:'' (detail login-gated), isCommercial }
+      principals: [],              // login/PDF-gated — see LIMITATION note at top
+      jurisdiction: r.jurisdiction || 'CALIFORNIA',
+      matchSimilarity: Number(best.sim.toFixed(2)),
+      sourceUrl: `${SOURCE_BASE}?SearchType=BUSINESS&SearchCriteria=${encodeURIComponent(r.entityName)}`,
+      source: 'ca-sos',
+      resolvedAt: new Date().toISOString(),
+    },
   };
 }
 

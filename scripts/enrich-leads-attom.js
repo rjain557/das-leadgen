@@ -180,4 +180,6 @@ async function main() {
   console.log(`Results JSON: ${RESULTS_PATH}`);
 }
 
-main().catch(console.error);
+// CLI-only: guard so the orchestrator can require() this without auto-running
+// main() (which would parse the orchestrator's argv / touch the CSV on import).
+if (require.main === module) main().catch(console.error);
